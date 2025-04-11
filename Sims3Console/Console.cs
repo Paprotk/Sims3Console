@@ -1,13 +1,21 @@
-﻿using System.Runtime.CompilerServices;
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Text;
 
 namespace Sims3Console
 {
     public static unsafe class NativeExports
     {
+        private static readonly object logLock = new object();
         private static Dictionary<string, StreamWriter> logWriters = new Dictionary<string, StreamWriter>();
+        private static Thread inputThread;
+        private static volatile bool isReadingInput = false;
 
-        [UnmanagedCallersOnly(EntryPoint = "ICallSetup", CallConvs = [typeof(CallConvCdecl)])]
+        [UnmanagedCallersOnly(EntryPoint = "ICallSetup", CallConvs = new[] { typeof(CallConvCdecl) })]
         public static void ICallSetup(delegate* unmanaged[Cdecl]<byte*, void*, void> addInternalCall)
         {
             var method1 = "Console::Create"u8;
@@ -36,21 +44,75 @@ namespace Sims3Console
             }
         }
 
-        [UnmanagedCallersOnly(EntryPoint = "ConsoleCreate", CallConvs = [typeof(CallConvStdcall)])]
+        [UnmanagedCallersOnly(EntryPoint = "ConsoleCreate", CallConvs = new[] { typeof(CallConvStdcall) })]
         public static void ConsoleCreate()
         {
             if (GetConsoleWindow() == IntPtr.Zero)
+            {
                 AllocConsole();
+                Console.SetIn(new StreamReader(Console.OpenStandardInput()));
+                Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+                Console.SetError(new StreamWriter(Console.OpenStandardError()) { AutoFlush = true });
+            }
+
+            if (inputThread == null || !inputThread.IsAlive)
+            {
+                isReadingInput = true;
+                inputThread = new Thread(ReadInputLoop);
+                inputThread.IsBackground = true;
+                inputThread.Start();
+            }
         }
 
-        [UnmanagedCallersOnly(EntryPoint = "ConsoleClose", CallConvs = [typeof(CallConvStdcall)])]
+        private static void ReadInputLoop()
+        {
+            while (isReadingInput)
+            {
+                try
+                {
+                    var input = Console.ReadLine();
+                    if (input != null)
+                    {
+                        Console.WriteLine($"> Console: {input}");
+
+                        lock (logLock)
+                        {
+                            foreach (var writer in logWriters.Values)
+                            {
+                                writer.WriteLine($"[{DateTime.Now:u}] INPUT: {input}");
+                                writer.Flush();
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    File.AppendAllText("console_input_errors.log", $"[{DateTime.Now:u}] {ex}\n");
+                }
+            }
+        }
+
+        [UnmanagedCallersOnly(EntryPoint = "ConsoleClose", CallConvs = new[] { typeof(CallConvStdcall) })]
         public static void ConsoleClose()
         {
+            isReadingInput = false;
+            
             if (GetConsoleWindow() != IntPtr.Zero)
+            {
                 FreeConsole();
+            }
+
+            lock (logLock)
+            {
+                foreach (var writer in logWriters.Values)
+                {
+                    writer.Close();
+                }
+                logWriters.Clear();
+            }
         }
 
-        [UnmanagedCallersOnly(EntryPoint = "ConsoleWriteLine", CallConvs = [typeof(CallConvStdcall)])]
+        [UnmanagedCallersOnly(EntryPoint = "ConsoleWriteLine", CallConvs = new[] { typeof(CallConvStdcall) })]
         public static void ConsoleWriteLine(sbyte* utf8Str)
         {
             try
@@ -58,56 +120,80 @@ namespace Sims3Console
                 string? str = Marshal.PtrToStringUTF8((IntPtr)utf8Str);
                 Console.WriteLine(str ?? "<null>");
 
-                // Write to all active logs
-                foreach (var writer in logWriters.Values)
+                lock (logLock)
                 {
-                    string datetime = DateTime.Now.ToString("dd MMM yyyy 'at' HH:mm");
-                    writer.WriteLine($"[{datetime}] {str ?? "<null>"}");
-                    writer.Flush();  // Flush after every write to ensure crash-proofing
+                    foreach (var writer in logWriters.Values)
+                    {
+                        writer.WriteLine($"[{DateTime.Now:u}] OUTPUT: {str ?? "<null>"}");
+                        writer.Flush();
+                    }
                 }
             }
             catch (Exception ex)
             {
-                File.AppendAllText("console_error.log", ex.ToString());
+                File.AppendAllText("console_output_errors.log", $"[{DateTime.Now:u}] {ex}\n");
             }
         }
 
-        [UnmanagedCallersOnly(EntryPoint = "ConsoleStartLogging", CallConvs = [typeof(CallConvStdcall)])]
+        [UnmanagedCallersOnly(EntryPoint = "ConsoleStartLogging", CallConvs = new[] { typeof(CallConvStdcall) })]
         public static void ConsoleStartLogging(sbyte* filenameUtf8)
         {
-            string filename = Marshal.PtrToStringUTF8((IntPtr)filenameUtf8) ?? "default_log";
-
-            // Create a logs directory if it does not exist
-            string logsDirectory = Path.Combine(Directory.GetCurrentDirectory(), "Logs");
-            if (!Directory.Exists(logsDirectory))
+            try
             {
-                Directory.CreateDirectory(logsDirectory);
+                string baseName = Marshal.PtrToStringUTF8((IntPtr)filenameUtf8) ?? "console";
+                string logsDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Logs");
+                Directory.CreateDirectory(logsDir);
+                
+                string logPath = Path.Combine(logsDir, 
+                    $"{baseName}_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.log");
+
+                lock (logLock)
+                {
+                    if (!logWriters.ContainsKey(logPath))
+                    {
+                        var writer = new StreamWriter(logPath, true, Encoding.UTF8)
+                        {
+                            AutoFlush = true
+                        };
+                        logWriters.Add(logPath, writer);
+                    }
+                }
             }
-
-            // Create the log file path inside the logs directory
-            string logFileName = Path.Combine(logsDirectory, $"{filename}_{DateTime.Now:dd_MM_yyyy_HH_mm}_log.txt");
-
-            // Add a new StreamWriter to the dictionary for the log file
-            if (!logWriters.ContainsKey(logFileName))
+            catch (Exception ex)
             {
-                logWriters[logFileName] = new StreamWriter(logFileName, append: true);
+                File.AppendAllText("logging_errors.log", $"[{DateTime.Now:u}] {ex}\n");
             }
         }
 
-        [UnmanagedCallersOnly(EntryPoint = "ConsoleStopLogging", CallConvs = [typeof(CallConvStdcall)])]
+        [UnmanagedCallersOnly(EntryPoint = "ConsoleStopLogging", CallConvs = new[] { typeof(CallConvStdcall) })]
         public static void ConsoleStopLogging(sbyte* filenameUtf8)
         {
-            string filename = Marshal.PtrToStringUTF8((IntPtr)filenameUtf8) ?? "default_log";
-
-            // Construct the log file name (same as StartLogging)
-            string logsDirectory = Path.Combine(Directory.GetCurrentDirectory(), "Logs");
-            string logFileName = Path.Combine(logsDirectory, $"{filename}_{DateTime.Now:dd_MM_yyyy_HH_mm}_log.txt");
-
-            // Stop logging for the specific file if it exists
-            if (logWriters.ContainsKey(logFileName))
+            try
             {
-                logWriters[logFileName].Close();
-                logWriters.Remove(logFileName);
+                string targetFile = Marshal.PtrToStringUTF8((IntPtr)filenameUtf8) ?? "console";
+                
+                lock (logLock)
+                {
+                    List<string> toRemove = new List<string>();
+                    
+                    foreach (var kvp in logWriters)
+                    {
+                        if (Path.GetFileNameWithoutExtension(kvp.Key).StartsWith(targetFile))
+                        {
+                            kvp.Value.Close();
+                            toRemove.Add(kvp.Key);
+                        }
+                    }
+                    
+                    foreach (var key in toRemove)
+                    {
+                        logWriters.Remove(key);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                File.AppendAllText("logging_errors.log", $"[{DateTime.Now:u}] {ex}\n");
             }
         }
 
